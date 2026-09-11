@@ -126,11 +126,11 @@ function sizing(cs, parentLayout, isRoot) {
   const grow = parseFloat(cs.flexGrow) || 0;
   const basis = (cs.flexBasis && cs.flexBasis.indexOf('px') > -1) ? px(cs.flexBasis) : null;
   const out = { h: 'HUG', v: 'HUG', minWidth: null, fixedWidth: null, maxWidth: null };
-  const maxW = cs.maxWidth && cs.maxWidth.indexOf('px') > -1 ? px(cs.maxWidth) : null;
-  if (maxW) out.maxWidth = maxW;
+  if (cs.maxWidth && cs.maxWidth.indexOf('px') > -1) out.maxWidth = px(cs.maxWidth);
+  if (cs.minWidth && cs.minWidth.indexOf('px') > -1) out.minWidth = px(cs.minWidth);
   if (isRoot) { out.h = 'FIXED'; return out; }
   if (parentLayout === 'HORIZONTAL') {
-    if (grow > 0) { out.h = 'FILL'; if (basis) out.minWidth = basis; }
+    if (grow > 0) { out.h = 'FILL'; if (basis && !out.minWidth) out.minWidth = basis; }
     else if (basis) { out.h = 'FIXED'; out.fixedWidth = basis; }
     out.v = 'FILL';
   } else {
@@ -233,15 +233,14 @@ function listNode(el, cs, sizes) {
 function walk(el, parentLayout, isRoot) {
   const cs = getComputedStyle(el);
   const tag = el.tagName.toLowerCase();
-  if (cs.display === 'none' || tag === 'style' || tag === 'script') return null;
+  if (cs.display === 'none' || isNonVisual(el)) return null;
   if (cs.position === 'absolute' || cs.position === 'fixed') warn('Absolute positioning was ignored.');
 
   const sizes = sizing(cs, parentLayout, isRoot);
   if (tag === 'ul' || tag === 'ol') return listNode(el, cs, sizes);
 
   const kids = Array.prototype.slice.call(el.children).filter(function (c) {
-    const t = c.tagName.toLowerCase();
-    return t !== 'style' && t !== 'script' && getComputedStyle(c).display !== 'none';
+    return !isNonVisual(c) && getComputedStyle(c).display !== 'none';
   });
 
   if (!kids.length) {
@@ -300,6 +299,10 @@ function walk(el, parentLayout, isRoot) {
     const minR = Math.min.apply(null, built.map(function (b) { return b.m.r; }));
     if (minL > 0) { node.padding.l += minL; built.forEach(function (b) { b.m.l -= minL; }); }
     if (minR > 0) { node.padding.r += minR; built.forEach(function (b) { b.m.r -= minR; }); }
+
+    // margin: 0 auto centres a child. Figma does that with the parent's cross axis
+    // alignment, and any max-width already carried over keeps the child from filling.
+    if (built.some(function (b) { return b.m.autoL && b.m.autoR; })) node.crossAlign = 'CENTER';
 
     const spacings = [];
     for (let i = 1; i < built.length; i++) {
@@ -399,6 +402,59 @@ function walk(el, parentLayout, isRoot) {
   return node;
 }
 
+// Tags that exist in the markup but never render anything.
+const NON_VISUAL = ['style', 'script', 'meta', 'title', 'link', 'base', 'head', 'noscript'];
+
+function isNonVisual(el) {
+  return NON_VISUAL.indexOf(el.tagName.toLowerCase()) > -1;
+}
+
+// A pasted full document has its html, head and body tags discarded by innerHTML, which
+// hoists meta and title into the sandbox and loses whatever the body itself was styled
+// with. So parse it properly, carry the stylesheets across, and stand a div in for body.
+// Rules written against the body selector are rewritten to match that div.
+function mount(html, box) {
+  box.innerHTML = '';
+  const looksLikeDocument = /<!doctype/i.test(html) || /<html[\s>]/i.test(html) || /<body[\s>]/i.test(html);
+
+  if (!looksLikeDocument) {
+    box.innerHTML = html;
+  } else {
+    const doc = new DOMParser().parseFromString(html, 'text/html');
+    const holder = document.createElement('div');
+    holder.className = 'h2f-body';
+    if (doc.body.getAttribute('style')) holder.setAttribute('style', doc.body.getAttribute('style'));
+
+    Array.prototype.slice.call(doc.querySelectorAll('style')).forEach(function (s) {
+      const copy = document.createElement('style');
+      // body and html selectors have to point at the stand in div instead.
+      copy.textContent = s.textContent.replace(/(^|[\s,{}>+~])(body|html)(?=[\s,{:.#\[>+~]|$)/g, '$1.h2f-body');
+      box.appendChild(copy);
+    });
+
+    Array.prototype.slice.call(doc.body.childNodes).forEach(function (n) {
+      holder.appendChild(document.importNode(n, true));
+    });
+    box.appendChild(holder);
+    warn('A full HTML document was pasted. The body element became the outer frame.');
+  }
+
+  // Pick something that actually renders. If several things do, keep them together.
+  const candidates = Array.prototype.slice.call(box.children).filter(function (c) {
+    return !isNonVisual(c) && getComputedStyle(c).display !== 'none';
+  });
+  if (!candidates.length) return null;
+  if (candidates.length === 1) return candidates[0];
+
+  const holder = document.createElement('div');
+  holder.className = 'h2f-multiple';
+  holder.style.display = 'flex';
+  holder.style.flexDirection = 'column';
+  candidates.forEach(function (c) { holder.appendChild(c); });
+  box.appendChild(holder);
+  return holder;
+}
+
 document.getElementById('clear').onclick = function () {
   document.getElementById('src').value = '';
   document.getElementById('log').textContent = '';
@@ -410,14 +466,12 @@ document.getElementById('go').onclick = function () {
   const html = document.getElementById('src').value.trim();
   if (!html) { log.textContent = 'Nothing to convert.'; return; }
 
-  const box = document.getElementById('sandbox');
-  box.innerHTML = html;
-  const root = Array.prototype.slice.call(box.children).find(function (c) { return c.tagName.toLowerCase() !== 'style'; });
-  if (!root) { log.textContent = 'No element found in that HTML.'; return; }
+  const root = mount(html, document.getElementById('sandbox'));
+  if (!root) { log.textContent = 'Found no renderable element in that HTML. Everything in it was style, script or metadata.'; return; }
 
   let tree;
   try { tree = walk(root, 'VERTICAL', true); } catch (e) { log.textContent = 'Walk failed: ' + e.message; return; }
-  if (!tree) { log.textContent = 'That produced nothing convertible.'; return; }
+  if (!tree) { log.textContent = 'The outer element converted to nothing. It may be empty, or hidden by display none.'; return; }
 
   log.textContent = 'Sending to canvas...';
   parent.postMessage({ pluginMessage: { type: 'build', tree: tree, warnings: warnings } }, '*');

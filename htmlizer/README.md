@@ -70,7 +70,21 @@ Transport is paste into a textarea. MCP transport was considered and deferred. I
 | `<ul>` / `<ol>` | ONE text node, `setRangeListOptions` plus `setRangeIndentation` |
 | `li` bottom margin | paragraph spacing and list spacing |
 | `column-count: n` on a list | n text nodes in a horizontal frame |
+| `min-width` / `max-width` in px | `minWidth` / `maxWidth` |
+| `margin: 0 auto` on a child | parent's cross axis alignment set to CENTER |
 | empty div with a fill and height under 8px | divider frame |
+
+### Input shapes
+
+Accepts either a bare fragment such as `<div class="wrap">…</div>` with its `<style>` block, or a **complete HTML document** with `<!DOCTYPE>`, `<html>`, `<head>` and `<body>`.
+
+The full document case needs real work, because assigning to `innerHTML` makes the browser discard the `html`, `head` and `body` tags and hoist their contents. That leaves `<meta>` and `<title>` sitting as siblings of the content, and loses whatever `body` itself was styled with. Padding and background on `body` is a common pattern, so losing it matters.
+
+So a document is parsed with `DOMParser`, its `<style>` blocks are copied across, and a div stands in for `body`. Rules written against the `body` or `html` selector are rewritten to target that div. The stand in then becomes the outer frame.
+
+The root element is chosen as the first child that actually renders, skipping `style`, `script`, `meta`, `title`, `link`, `base`, `head`, `noscript` and anything with `display: none`. If several things render, they are wrapped together rather than the first one being picked.
+
+**The original bug here is instructive.** The root picker took the first child that was not a `<style>`, which on a full document is the `<meta>`. Since `meta` is `display: none`, the walker returned nothing and the plugin reported "That produced nothing convertible", which said nothing useful about the cause. Error messages now name what was actually found.
 
 ### Sizing
 
