@@ -1,6 +1,6 @@
 {
-  "name": "HTMLizer for Claude",
-  "id": "htmlizer-for-claude-local",
+  "name": "HTMLizer",
+  "id": "htmlizer",
   "api": "1.0.0",
   "main": "code.js",
   "ui": "ui.html",
