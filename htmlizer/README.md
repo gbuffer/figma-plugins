@@ -1,8 +1,8 @@
-# HTMLizer for Claude
+# HTMLizer
 
 A local Figma development plugin. Paste HTML into it, get real Figma auto layout frames and text nodes on the canvas.
 
-Built for Grant Hull (Remsoft) with Claude, September 2026.
+Built for Grant Hull (Remsoft) with Claude, September 2026. Lives in the `figma-plugins` monorepo, self contained, no build step.
 
 ## The one rule that matters
 
@@ -11,6 +11,8 @@ Built for Grant Hull (Remsoft) with Claude, September 2026.
 The plugin is the shared artefact. The HTML is whatever any Claude, any teammate, or any web page happens to produce. If a colleague is handed this plugin and asks their own Claude for a diagram, that Claude knows nothing about this converter and should not have to.
 
 So when something renders wrong, the fix goes in `ui.html` or `code.js`. Rewriting the source HTML to dodge a converter limitation is the wrong direction and was explicitly rejected during the build. If a session starts "let me adjust the HTML so the plugin handles it", that is the mistake.
+
+**Any CSS this converter mishandles is a converter bug, not a document bug.** The reason is not purity. A document rewritten to suit the converter fixes exactly one document, while the next one hits the same limitation and its author has no way of knowing the rules. Tuning the HTML also hides the defect, so it is still there when someone else meets it. During the build, three rounds of fixes went into the converter and the source HTML was reverted to its original unmodified form, which then converted correctly. That is the evidence the rule works.
 
 The only exception is a genuine CSS feature the converter cannot express in Figma at all, and those are listed under Known limits below. Even then, prefer adding converter support first.
 
@@ -31,7 +33,9 @@ Cmd K, type "import plugin from manifest", pick `manifest.json`. Or Figma menu, 
 
 All three files must sit in one real folder on disk. Figma reads `code.js` and `ui.html` by relative path from the manifest.
 
-Appears as **HTMLizer for Claude** under Plugins, Development.
+Appears as **HTMLizer** under Plugins, Development.
+
+Re-import after changing `name` or `id` in the manifest, since Figma reads both at import time. Code changes in `ui.html` and `code.js` are picked up on the next run with no re-import.
 
 ## Architecture
 
@@ -41,7 +45,7 @@ Two halves, as every Figma plugin has.
 
 `code.js` runs in the Figma sandbox with no DOM. It receives the tree and builds frames and text nodes.
 
-`manifest.json` is a four line pointer. It has changed exactly once, to set the name. It should not need to change again.
+`manifest.json` is a four line pointer: `name` is the display label, `id` only has to be unique among locally imported plugins, and `main` and `ui` name the two files above. Currently name `HTMLizer`, id `htmlizer`. Nothing about the conversion depends on it.
 
 Transport is paste into a textarea. MCP transport was considered and deferred. If it comes back, `html.to.design` already exposes an `import-html` MCP tool at `https://mcp.to.design`, which is cheaper than building one.
 
@@ -104,13 +108,23 @@ Real Figma constraints, not laziness:
 - Font weights are snapped to real weights. 650 becomes Semi Bold.
 - Fonts missing from Figma fall back to Inter and are reported.
 
-## Debugging
+## Testing a change
 
-The plugin logs what it built, which fonts fell back, and every dialect violation it hit. Send that log plus a screenshot.
+**Nobody in a chat session can run this.** Figma is a desktop app on Grant's machine and the converter only does anything once real HTML goes through it in a real Figma file. A change you reason about is a hypothesis, not a fix.
 
-For a single misbehaving element, the Figma layer properties panel in dev mode, copied or screenshotted, is the cheapest useful evidence: it shows exactly what that node resolved to.
+So the loop is: hand over the edited file, say what you changed and what should now happen, and wait. Grant drops the file into the local repo folder, runs the plugin, and reports back. Do not say a change works, or that something is fixed, before seeing evidence.
 
-For structural problems, where the question is which frames Figma silently made fixed, a Figma MCP link to the frame is worth the much higher token cost. Otherwise prefer the screenshot.
+What to ask for, cheapest first:
+
+The **plugin's log line**, which reports frames, text nodes and spacers built, font fallbacks, and every dialect violation it hit. Often enough on its own.
+
+A **screenshot of the result**. Annotated is better, and Grant tends to annotate in red, which is more precise than either of the other two options.
+
+The **Figma layer properties panel** in dev mode for one misbehaving element, copied or screenshotted. This is the right tool when the question is what a single node resolved to.
+
+A **Figma MCP link** to the frame. Much higher token cost, worth it only when the question is structural, such as which frames Figma silently made fixed rather than hugging. Prefer a screenshot otherwise.
+
+Change one thing at a time. Three of the fixes during the build looked correct in reasoning and were wrong in Figma, and they were only separable because they were tested separately.
 
 ## Cost note
 

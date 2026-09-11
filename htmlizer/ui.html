@@ -1,3 +1,29 @@
+<!--
+  HTMLizer. Converts pasted HTML into Figma auto layout frames and text nodes.
+
+  ============================================================================
+  THE ONE RULE: adapt this converter to the HTML, never the HTML to this
+  converter.
+
+  The HTML arriving here is whatever any Claude, teammate or web page produced.
+  It knows nothing about this file and should not have to. So if a document
+  renders wrong, the bug is HERE, in this file or in code.js.
+
+  Do NOT "fix" it by rewriting the source HTML to suit the converter. That was
+  tried during the build and explicitly rejected, because the next document
+  hits the same limitation and whoever wrote it has no way to know the rules.
+  Any CSS this converter mishandles is a converter bug, not a document bug.
+
+  Full spec, design decisions and known limits: see README.md in this folder.
+  Read it before changing anything. Several decisions here were reached by
+  trying the obvious thing first and finding out why it does not work.
+
+  Neither you nor the person you are helping can run Figma from a chat. You
+  cannot verify a change yourself. Hand over the edited file, ask for the
+  plugin's log line and a screenshot, and do not claim a fix works until you
+  have seen them.
+  ============================================================================
+-->
 <style>
   body { margin: 0; padding: 12px; font: 12px/1.45 "Inter", -apple-system, sans-serif; color: #222; }
   h2 { font-size: 12px; margin: 0 0 8px; font-weight: 600; }

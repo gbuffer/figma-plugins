@@ -1,3 +1,26 @@
+// HTMLizer. Figma sandbox half: receives a JSON tree from ui.html and builds nodes.
+//
+// =============================================================================
+// THE ONE RULE: adapt this converter to the HTML, never the HTML to this
+// converter. If a document renders wrong, the bug is here or in ui.html, never
+// in the source HTML. Rewriting the HTML to suit the converter was tried and
+// rejected: the next document hits the same limitation and its author has no
+// way to know the rules. Any CSS this converter mishandles is a converter bug.
+//
+// Full spec and known limits: README.md in this folder. Read it first.
+//
+// Two things in this file that look wrong and are not:
+//   - Sizing is applied AFTER appendChild, because FILL cannot resolve against
+//     a parent that does not exist yet. Do not move applySizing earlier.
+//   - layoutSizingHorizontal / Vertical are used in preference to layoutAlign,
+//     layoutGrow and counterAxisSizingMode. The old properties conflict with
+//     each other and caused the first round of bugs. They survive only as a
+//     fallback inside a catch block.
+//
+// You cannot run Figma from a chat, so you cannot verify a change. Ask for the
+// plugin's log line and a screenshot before claiming a fix works.
+// =============================================================================
+
 figma.showUI(__html__, { width: 470, height: 560, themeColors: true });
 
 let counts = { frames: 0, texts: 0, spacers: 0 };
