@@ -19,6 +19,12 @@
 //
 // You cannot run Figma from a chat, so you cannot verify a change. Ask for the
 // plugin's log line and a screenshot before claiming a fix works.
+//
+// If this edit changes what the converter actually does, bump the version in
+// manifest.json's name field ("HTMLizer vN") and in ui.html's version line, and
+// add one line to README.md's Version section. Figma rejects any manifest
+// field it does not recognise, so the number lives in the name string, not a
+// field of its own. Skip the bump for a comment-only or wording change.
 // =============================================================================
 
 figma.showUI(__html__, { width: 470, height: 560, themeColors: true });

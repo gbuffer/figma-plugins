@@ -22,11 +22,18 @@
   cannot verify a change yourself. Hand over the edited file, ask for the
   plugin's log line and a screenshot, and do not claim a fix works until you
   have seen them.
+
+  If this edit changes what the converter actually does, bump the version
+  number below and in manifest.json's name field ("HTMLizer vN"), and add one
+  line to README.md's Version section. Figma rejects any manifest field it
+  does not recognise, so the number lives in the name string, not a field of
+  its own. Skip the bump for a comment-only or wording change.
   ============================================================================
 -->
 <style>
   body { margin: 0; padding: 12px; font: 12px/1.45 "Inter", -apple-system, sans-serif; color: #222; }
   h2 { font-size: 12px; margin: 0 0 8px; font-weight: 600; }
+  .version { font-size: 10.5px; color: #9a9f95; margin: -6px 0 10px; }
   textarea { width: 100%; height: 270px; box-sizing: border-box; font: 11px/1.4 ui-monospace, Menlo, monospace; border: 1px solid #d6d8d0; border-radius: 4px; padding: 8px; resize: vertical; }
   .bar { display: flex; gap: 8px; align-items: center; margin-top: 10px; }
   button { font: 500 12px/1 "Inter", sans-serif; padding: 9px 14px; border: 0; border-radius: 5px; background: #1F3D2B; color: #fff; cursor: pointer; }
@@ -37,6 +44,7 @@
 </style>
 
 <h2>Paste the HTML, including its style block</h2>
+<div class="version">v3 — see README.md for what changed at each version</div>
 <textarea id="src" placeholder="&lt;div class=&quot;card&quot;&gt; ... &lt;/div&gt;"></textarea>
 <div class="bar">
   <button id="go">Convert to Figma</button>
@@ -89,6 +97,75 @@ function margins(el) {
   return out;
 }
 
+// Authored length, so a plain "width: 150px" is honoured even though it lives on a flex
+// item where flex-basis, not width, is the property people expect to matter. Mirrors the
+// margins() trick: computedStyleMap keeps the specified value rather than resolving it.
+function explicitLength(el, prop) {
+  try {
+    const v = el.computedStyleMap().get(prop);
+    if (v && typeof v.value === 'number' && v.unit === 'px') return v.value;
+  } catch (e) {}
+  return null;
+}
+
+// True for any authored height that is not the default "auto", px or percentage alike.
+// A percentage height, such as height:100% used to draw a vertical line, cannot become
+// a Figma FILL if its own parent is going to hug, so this flags the case where the
+// author's intent has to be approximated from the measured rect instead.
+function hasNonAutoHeight(el) {
+  try {
+    const v = el.computedStyleMap().get('height');
+    return !!v && String(v) !== 'auto';
+  } catch (e) {
+    return false;
+  }
+}
+
+// A short, legible slug from free text: lowercase, hyphenated, no run-on punctuation.
+// Returns null rather than an empty string, so callers can tell "no usable text" apart
+// from "a slug that happens to be short".
+function slugify(s, maxLen) {
+  const slug = s.toLowerCase().trim().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
+  return slug ? slug.slice(0, maxLen || 40) : null;
+}
+
+// A layer's Figma name, tried in order of how likely each source is to already be a real
+// label rather than an accident of markup:
+//   1. data-name, the html-diagram-for-figma skill's own attribute. Nothing else in
+//      ordinary HTML ever writes this, so its presence is a clean signal someone meant
+//      it as a name.
+//   2. id, the one attribute most HTML authors reach for to label an element even with
+//      no idea this converter exists. Can be framework noise (a hash, a generated
+//      counter), but noise here still beats no name at all.
+//   3. class, the original fallback, shared across elements so less specific than id.
+//   4. a slug built from the element's own text content, for a frame with real words
+//      inside it but no name of any kind. Not attempting anything smarter than "read
+//      what's already there": no picking the most distinctive word, no reordering.
+//   5. the tag plus its position among its siblings, reserved for a structural div with
+//      nothing else to go on. Not a name, but "div-3" beats an unlabelled "div" among six
+//      identical ones: it at least tells two apart, and is a place to start renaming from.
+function nodeName(el, fallback) {
+  const dn = el.getAttribute && el.getAttribute('data-name');
+  if (dn && dn.trim()) return dn.trim().slice(0, 60);
+
+  const id = el.id && el.id.trim();
+  if (id) return id.slice(0, 60);
+
+  const cls = String(el.className || '').split(' ')[0];
+  if (cls) return cls;
+
+  const txt = (el.textContent || '').trim().replace(/\s+/g, ' ');
+  const slug = txt ? slugify(txt, 40) : null;
+  if (slug) return slug;
+
+  const parent = el.parentElement;
+  if (parent) {
+    const idx = Array.prototype.indexOf.call(parent.children, el) + 1;
+    if (idx > 0) return fallback + '-' + idx;
+  }
+  return fallback;
+}
+
 function readBorders(cs) {
   const sides = { top: 'Top', right: 'Right', bottom: 'Bottom', left: 'Left' };
   const widths = {}; const present = [];
@@ -122,20 +199,34 @@ function align(v) {
   return 'MIN';
 }
 
-function sizing(cs, parentLayout, isRoot) {
+function sizing(cs, parentLayout, isRoot, el) {
   const grow = parseFloat(cs.flexGrow) || 0;
   const basis = (cs.flexBasis && cs.flexBasis.indexOf('px') > -1) ? px(cs.flexBasis) : null;
-  const out = { h: 'HUG', v: 'HUG', minWidth: null, fixedWidth: null, maxWidth: null };
+  const explicitW = explicitLength(el, 'width');
+  const explicitH = explicitLength(el, 'height');
+  const out = { h: 'HUG', v: 'HUG', minWidth: null, fixedWidth: null, maxWidth: null, fixedHeight: null };
   if (cs.maxWidth && cs.maxWidth.indexOf('px') > -1) out.maxWidth = px(cs.maxWidth);
   if (cs.minWidth && cs.minWidth.indexOf('px') > -1) out.minWidth = px(cs.minWidth);
   if (isRoot) { out.h = 'FIXED'; return out; }
   if (parentLayout === 'HORIZONTAL') {
     if (grow > 0) { out.h = 'FILL'; if (basis && !out.minWidth) out.minWidth = basis; }
     else if (basis) { out.h = 'FIXED'; out.fixedWidth = basis; }
-    out.v = 'FILL';
+    else if (explicitW != null) { out.h = 'FIXED'; out.fixedWidth = explicitW; }
+    // Height stays HUG, same as a vertical row's children. FILL was tried here as the
+    // equal-height-cards pattern; direct testing in Figma showed it does not reliably
+    // resolve once two siblings have genuinely different content lengths, so a correct,
+    // individually-hugged card beats a shared height that only sometimes arrives. See
+    // "Equal height cards, retracted" in the README.
+  } else if (explicitW != null) {
+    out.h = 'FIXED'; out.fixedWidth = explicitW;
   } else {
     out.h = 'FILL';
   }
+  // A definite height beats the generic default in either direction. This is what stops
+  // an element with height:28px from being left to hug when its parent is vertical, and
+  // is the other half of what makes the percentage height case safe: see hasNonAutoHeight
+  // at the one call site that also measures the rendered rect.
+  if (explicitH != null) { out.v = 'FIXED'; out.fixedHeight = explicitH; }
   return out;
 }
 
@@ -162,7 +253,7 @@ function frameSpec(name, layout) {
     align: 'MIN', crossAlign: 'MIN',
     padding: { t: 0, r: 0, b: 0, l: 0 },
     radius: 0, fill: null, borders: null, clip: false,
-    sizeH: 'FILL', sizeV: 'HUG', minWidth: null, fixedWidth: null, maxWidth: null,
+    sizeH: 'FILL', sizeV: 'HUG', minWidth: null, fixedWidth: null, maxWidth: null, fixedHeight: null,
     children: []
   };
 }
@@ -183,6 +274,7 @@ function boxIfNeeded(node, cs, sizes) {
   box.radius = dec.radius; box.fill = dec.fill; box.borders = dec.borders;
   box.clip = cs.overflow === 'hidden';
   box.sizeH = sizes.h; box.minWidth = sizes.minWidth; box.fixedWidth = sizes.fixedWidth; box.maxWidth = sizes.maxWidth;
+  if (sizes.fixedHeight != null) { box.sizeV = 'FIXED'; box.fixedHeight = sizes.fixedHeight; }
   box.children = [node];
   return box;
 }
@@ -236,7 +328,7 @@ function walk(el, parentLayout, isRoot) {
   if (cs.display === 'none' || isNonVisual(el)) return null;
   if (cs.position === 'absolute' || cs.position === 'fixed') warn('Absolute positioning was ignored.');
 
-  const sizes = sizing(cs, parentLayout, isRoot);
+  const sizes = sizing(cs, parentLayout, isRoot, el);
   if (tag === 'ul' || tag === 'ol') return listNode(el, cs, sizes);
 
   const kids = Array.prototype.slice.call(el.children).filter(function (c) {
@@ -247,14 +339,39 @@ function walk(el, parentLayout, isRoot) {
     const txt = (el.textContent || '').trim().replace(/\s+/g, ' ');
     if (!txt) {
       const dec = decoration(cs);
-      if (dec.transparent) return null;
       const r = el.getBoundingClientRect();
-      const node = frameSpec(String(el.className || '').split(' ')[0] || 'rule', 'VERTICAL');
+      const explicitW = explicitLength(el, 'width');
+      const nonAutoH = hasNonAutoHeight(el);
+      const isSmall = r.width <= 8 || r.height <= 8;
+
+      // An empty element with no fill, no border and no size the author actually set is
+      // noise, most likely left over from a template. Drop it. Anything that specifies
+      // its own size exists on purpose, either as a spacer holding a gap open or as a
+      // hand drawn rule line, and both are kept even with no fill.
+      if (dec.transparent && explicitW == null && !nonAutoH && !isSmall) return null;
+
+      const node = frameSpec(nodeName(el, dec.transparent ? 'spacer' : 'rule'), 'VERTICAL');
       node.fill = dec.fill; node.borders = dec.borders; node.radius = dec.radius;
-      node.sizeH = r.width <= 8 ? 'FIXED' : sizes.h;
-      node.sizeV = r.height <= 8 ? 'FIXED' : sizes.v;
-      node.fixedWidth = r.width <= 8 ? Math.max(1, Math.round(r.width)) : sizes.fixedWidth;
-      node.fixedHeight = r.height <= 8 ? Math.max(1, Math.round(r.height)) : null;
+      node.minWidth = sizes.minWidth; node.maxWidth = sizes.maxWidth;
+
+      node.sizeH = explicitW != null ? 'FIXED' : (r.width <= 8 ? 'FIXED' : sizes.h);
+      node.fixedWidth = explicitW != null ? explicitW : (r.width <= 8 ? Math.max(1, Math.round(r.width)) : sizes.fixedWidth);
+
+      // A transparent leaf with no authored height only ever got a height at all because
+      // the browser's default align-items: stretch gave it one for free. That measured
+      // number reflects nothing the author asked for, and trusting it as FILL puts an
+      // empty node in competition with a real sibling for a height nothing here actually
+      // drives. Hug it instead: an empty frame hugs to zero, contributes nothing to the
+      // parent's own height, and leaves the sibling with real content to decide it alone,
+      // the same way the browser did. This is what a 690px offset column collapsing a
+      // whole row into a tall, narrow sliver turned out to be.
+      if (dec.transparent && !nonAutoH) {
+        node.sizeV = 'HUG';
+        node.isSpacer = true;   // flagged so a horizontal row can drop it for native alignment; see below
+      } else {
+        node.sizeV = (nonAutoH || r.height <= 8) ? 'FIXED' : sizes.v;
+        node.fixedHeight = Math.max(1, Math.round(r.height));
+      }
       return node;
     }
     return boxIfNeeded(textSpec(cs, txt), cs, sizes);
@@ -270,7 +387,7 @@ function walk(el, parentLayout, isRoot) {
   const blockFlow = !flex;   // block layout collapses adjacent vertical margins; flex does not
 
   const dec = decoration(cs);
-  const node = frameSpec(String(el.className || '').split(' ')[0] || tag, layout);
+  const node = frameSpec(nodeName(el, tag), layout);
   node.gap = layout === 'HORIZONTAL' ? px(cs.columnGap || cs.gap) : px(cs.rowGap || cs.gap);
   node.align = align(cs.justifyContent);
   node.crossAlign = align((cs.alignItems === 'stretch' || cs.alignItems === 'normal') ? 'flex-start' : cs.alignItems);
@@ -279,6 +396,7 @@ function walk(el, parentLayout, isRoot) {
   node.clip = cs.overflow === 'hidden';
   node.sizeH = sizes.h; node.sizeV = sizes.v;
   node.minWidth = sizes.minWidth; node.fixedWidth = sizes.fixedWidth; node.maxWidth = sizes.maxWidth;
+  node.fixedHeight = sizes.fixedHeight;
 
   const built = [];
   for (const k of kids) {
@@ -286,6 +404,64 @@ function walk(el, parentLayout, isRoot) {
     if (spec) built.push({ spec: spec, el: k, m: margins(k), cs: getComputedStyle(k) });
   }
   if (!built.length) return null;
+
+  // A spacer sitting at either end of a horizontal row exists only to push the real
+  // content to the far side, a job Figma's own alignment already does natively. Keeping
+  // the spacer as a node means giving it a width, and a fixed px width in the source CSS
+  // is not actually fixed in the browser once its flexible sibling has room to negotiate
+  // for: the two shrink and grow against each other, so a literal number copied out of
+  // the CSS routinely does not match what the browser actually rendered. Dropping the
+  // spacer and aligning the row to the opposite end sidesteps that arithmetic entirely.
+  if (layout === 'HORIZONTAL') {
+    const spacerAt = built.findIndex(function (b) { return b.spec.isSpacer; });
+    if ((spacerAt === 0 || spacerAt === built.length - 1) && built.length > 1) {
+      const pushToFarEnd = spacerAt === 0;
+      built.splice(spacerAt, 1);
+      node.align = pushToFarEnd ? 'MAX' : 'MIN';
+      // The remaining content no longer has a sibling to negotiate width against, and
+      // that removes the one thing FILL was resolving relative to. HUG is not the answer
+      // either: if this element's own children are themselves FILL, expecting a real
+      // number from here, a HUG parent with FILL children is the identical deadlock one
+      // level down, neither side has anything concrete, and both collapse. What the
+      // sandbox actually measured is a real number either side can anchor to, so that is
+      // what gets used, in place of a relative instruction with nothing left to resolve
+      // against.
+      built.forEach(function (b) {
+        if (b.spec.sizeH === 'FILL') {
+          const r = b.el.getBoundingClientRect();
+          b.spec.sizeH = 'FIXED';
+          b.spec.fixedWidth = Math.max(1, Math.round(r.width));
+          b.spec.minWidth = null;
+        }
+      });
+    }
+  }
+
+  // align-items: stretch, the flexbox default when nothing else is set, makes every
+  // child in a row match the tallest one, and a shorter child's own background simply
+  // extends to fill the gap rather than leaving a visible seam. A HUG child cannot
+  // reproduce that on its own, it just sits at its own natural height, and asking it to
+  // FILL needs a parent with a real number to fill into, which a HUG row does not have
+  // to give: exactly the failure in "Equal height cards, retracted" above, and forcing
+  // this carelessly would reproduce it. The safe version measures what the row actually
+  // stretched to in the real sandbox, pins the row to that as a FIXED height, and only
+  // then lets real content FILL against that concrete anchor. A bare line of text is
+  // left alone rather than asked to FILL: Figma resizes a text node's own height
+  // automatically, and that was never tested alongside FILL together. It is centred in
+  // the row instead, which looks identical for anything with no background of its own
+  // to reveal the difference.
+  if (layout === 'HORIZONTAL' && (cs.alignItems === 'stretch' || cs.alignItems === 'normal') && built.length > 1) {
+    const rowRect = el.getBoundingClientRect();
+    node.sizeV = 'FIXED';
+    node.fixedHeight = Math.max(1, Math.round(rowRect.height));
+    let bareTextLeftOut = false;
+    built.forEach(function (b) {
+      if (b.spec.isSpacer) return;
+      if (b.spec.kind === 'FRAME') { b.spec.sizeV = 'FILL'; }
+      else { bareTextLeftOut = true; }
+    });
+    if (bareTextLeftOut) node.crossAlign = 'CENTER';
+  }
 
   // Frames have no margin, so margins are expressed as padding, gap, wrappers or spacers.
   if (layout === 'VERTICAL') {
