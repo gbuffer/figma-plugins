@@ -38,25 +38,37 @@
   .bar { display: flex; gap: 8px; align-items: center; margin-top: 10px; }
   button { font: 500 12px/1 "Inter", sans-serif; padding: 9px 14px; border: 0; border-radius: 5px; background: #1F3D2B; color: #fff; cursor: pointer; }
   button.ghost { background: #eceee8; color: #333; }
+  .vw { margin-left: auto; color: #6b6f66; font-size: 11px; }
+  .vw input { width: 58px; font: 11px "Inter", sans-serif; padding: 4px; border: 1px solid #d6d8d0; border-radius: 4px; }
   #log { margin-top: 10px; font-size: 11px; color: #6b6f66; white-space: pre-wrap; max-height: 150px; overflow: auto; }
   #log .warn { color: #9a5b12; }
   #sandbox { position: fixed; left: -99999px; top: 0; }
 </style>
 
 <h2>Paste the HTML, including its style block</h2>
-<div class="version">v5 — see README.md for what changed at each version</div>
+<div class="version">v6 — see README.md for what changed at each version</div>
 <textarea id="src" placeholder="&lt;div class=&quot;card&quot;&gt; ... &lt;/div&gt;"></textarea>
 <div class="bar">
   <button id="go">Convert to Figma</button>
   <button class="ghost" id="clear">Clear</button>
+  <label class="vw" title="The browser width the HTML is laid out at, which decides which of its media queries apply">Render width <input id="vw" type="number" value="1280" min="320" max="3840" step="10"> px</label>
 </div>
 <div id="log"></div>
 <div id="sandbox"></div>
 
-<script>
+<!--
+  The converter itself. Never run in this window: its source is appended to the pasted
+  page inside the render iframe and runs there. See mount() in the script below for why.
+-->
+<script type="text/x-htmlizer-walker" id="walker">
 const warnings = [];
 function warn(m) { if (warnings.indexOf(m) === -1) warnings.push(m); }
 function px(v) { const n = parseFloat(v); return isNaN(n) ? 0 : n; }
+
+// Every element lives inside the render iframe's own document (see mount), so its styles
+// are read through that document's window, not this one.
+function css(el) { return el.ownerDocument.defaultView.getComputedStyle(el); }
+function noMargin() { return { t: 0, r: 0, b: 0, l: 0, autoT: false, autoB: false, autoL: false, autoR: false }; }
 
 function colour(v) {
   if (!v || v === 'none' || v === 'transparent') return null;
@@ -78,7 +90,7 @@ function fontStyle(weight, italic) {
 
 // Authored margins, so that "auto" survives instead of arriving as a resolved pixel value.
 function margins(el) {
-  const cs = getComputedStyle(el);
+  const cs = css(el);
   const out = { t: px(cs.marginTop), r: px(cs.marginRight), b: px(cs.marginBottom), l: px(cs.marginLeft), autoT: false, autoB: false, autoL: false, autoR: false };
   try {
     const map = el.computedStyleMap();
@@ -151,10 +163,19 @@ function nodeName(el, fallback) {
   const id = el.id && el.id.trim();
   if (id) return id.slice(0, 60);
 
-  const cls = String(el.className || '').split(' ')[0];
+  // getAttribute rather than className, which on an SVG element is an object and came
+  // out as the layer name "[object".
+  const cls = (el.getAttribute('class') || '').trim().split(/\s+/)[0];
   if (cls) return cls;
 
-  const txt = (el.textContent || '').trim().replace(/\s+/g, ' ');
+  // A full document's body is the outer frame; the page's own title names it better than
+  // a slug of everything on the page.
+  if (el.tagName.toLowerCase() === 'body') return (el.ownerDocument.title || '').trim().slice(0, 60) || 'body';
+
+  // A table row's textContent runs its cells together with no space between them
+  // ("Script + planWording..."), so the row is named after its first cell instead.
+  const named = el.tagName.toLowerCase() === 'tr' && el.firstElementChild ? el.firstElementChild : el;
+  const txt = (named.textContent || '').trim().replace(/\s+/g, ' ');
   const slug = txt ? slugify(txt, 40) : null;
   if (slug) return slug;
 
@@ -208,6 +229,12 @@ function sizing(cs, parentLayout, isRoot, el) {
   if (cs.maxWidth && cs.maxWidth.indexOf('px') > -1) out.maxWidth = px(cs.maxWidth);
   if (cs.minWidth && cs.minWidth.indexOf('px') > -1) out.minWidth = px(cs.minWidth);
   if (isRoot) { out.h = 'FIXED'; return out; }
+  // A table cell's width is set by its whole column, not by its own content, so the one
+  // number that lines the columns up across every row is the width the browser measured.
+  if (cs.display === 'table-cell') {
+    out.h = 'FIXED'; out.fixedWidth = Math.max(1, Math.round(el.getBoundingClientRect().width));
+    return out;
+  }
   if (parentLayout === 'HORIZONTAL') {
     if (grow > 0) { out.h = 'FILL'; if (basis && !out.minWidth) out.minWidth = basis; }
     else if (basis) { out.h = 'FIXED'; out.fixedWidth = basis; }
@@ -219,6 +246,10 @@ function sizing(cs, parentLayout, isRoot, el) {
     // "Equal height cards, retracted" in the README.
   } else if (explicitW != null) {
     out.h = 'FIXED'; out.fixedWidth = explicitW;
+  } else if (/^inline-(block|flex|grid|table)$/.test(cs.display)) {
+    // An inline-block is as wide as its content, a pill or badge, not as wide as the line
+    // it sits on. FILL stretched every CP1 and "to run" pill across the whole page.
+    out.h = 'HUG';
   } else {
     out.h = 'FILL';
   }
@@ -230,21 +261,112 @@ function sizing(cs, parentLayout, isRoot, el) {
   return out;
 }
 
-function textSpec(cs, characters) {
+// text-transform changes what is drawn, not textContent, so it has to be carried over as
+// Figma's own text case or an uppercase table header arrives in lowercase.
+const TEXT_CASE = { uppercase: 'UPPER', lowercase: 'LOWER', capitalize: 'TITLE' };
+
+// The parts of a text style that can differ within one Figma text node, range by range.
+function runStyle(cs) {
   return {
+    fontFamily: (cs.fontFamily || 'Inter').split(',')[0].replace(/["']/g, '').trim(),
+    fontStyle: fontStyle(cs.fontWeight, cs.fontStyle),
+    fontSize: px(cs.fontSize),
+    colour: colour(cs.color) || { r: 0, g: 0, b: 0, a: 1 },
+    textCase: TEXT_CASE[cs.textTransform] || null
+  };
+}
+
+function styleKey(s) {
+  return [s.fontFamily, s.fontStyle, s.fontSize, s.colour.r, s.colour.g, s.colour.b, s.colour.a, s.textCase].join('|');
+}
+
+function textSpec(cs, characters) {
+  return Object.assign(runStyle(cs), {
     kind: 'TEXT',
     name: (characters || '').slice(0, 34).replace(/\s+/g, ' ') || 'text',
     characters: characters,
-    fontSize: px(cs.fontSize),
-    fontFamily: (cs.fontFamily || 'Inter').split(',')[0].replace(/["']/g, '').trim(),
-    fontStyle: fontStyle(cs.fontWeight, cs.fontStyle),
-    colour: colour(cs.color) || { r: 0, g: 0, b: 0, a: 1 },
     lineHeight: cs.lineHeight === 'normal' ? null : { value: px(cs.lineHeight), unit: 'PIXELS' },
     letterSpacing: px(cs.letterSpacing),
     hAlign: cs.textAlign === 'center' ? 'CENTER' : (cs.textAlign === 'right' ? 'RIGHT' : 'LEFT'),
+    runs: [],
     list: false, ordered: false, paragraphSpacing: 0, listSpacing: 0,
     sizeH: 'FILL', sizeV: 'HUG', minWidth: null, fixedWidth: null, maxWidth: null
-  };
+  });
+}
+
+// pre, pre-wrap and break-spaces keep every space and newline as written. Collapsing them
+// the normal way turned a code block into one run-on paragraph.
+function keepsWhitespace(cs) {
+  const c = cs.whiteSpaceCollapse || '';
+  return c === 'preserve' || c === 'break-spaces' || /^(pre|pre-wrap|break-spaces)$/.test(cs.whiteSpace);
+}
+
+function textOf(el, cs) {
+  const raw = el.textContent || '';
+  if (keepsWhitespace(cs)) return raw.replace(/^\r?\n/, '').replace(/\s+$/, '');
+  if (cs.whiteSpace === 'pre-line' || cs.whiteSpaceCollapse === 'preserve-breaks') {
+    return raw.replace(/[ \t]+/g, ' ').replace(/ ?\n ?/g, '\n').trim();
+  }
+  return raw.trim().replace(/\s+/g, ' ');
+}
+
+// Reads a paragraph that mixes plain text with inline tags, <b>, <em>, <code>, <a>, into
+// one string plus the style of every stretch of it, so it becomes one Figma text node with
+// styled ranges. Reading textContent alone kept the words and lost the bold; walking the
+// tags as children kept the bold and dropped the loose text between them.
+function richText(root) {
+  const keep = keepsWhitespace(css(root));
+  let text = '';
+  const runs = [];
+  (function visit(n) {
+    if (n.nodeType === 3) {
+      let s = n.textContent;
+      if (!keep) {
+        s = s.replace(/\s+/g, ' ');
+        if (s.charAt(0) === ' ' && (!text || /\s$/.test(text))) s = s.slice(1);
+      }
+      if (!s) return;
+      runs.push(Object.assign(runStyle(css(n.parentElement)), { start: text.length, end: text.length + s.length }));
+      text += s;
+    } else if (n.nodeType === 1 && !isNonVisual(n) && css(n).display !== 'none') {
+      if (n.tagName.toLowerCase() === 'br') { text += '\n'; return; }
+      Array.prototype.forEach.call(n.childNodes, visit);
+    }
+  })(root);
+  text = text.replace(/\s+$/, '');
+  runs.forEach(function (r) { r.end = Math.min(r.end, text.length); });
+  return { text: text, runs: runs.filter(function (r) { return r.end > r.start; }) };
+}
+
+// Keeps only the ranges that differ from the text node's own base style, merged where
+// neighbours match, so a plain paragraph carries no ranges at all.
+function withRuns(spec, runs) {
+  const base = styleKey(spec);
+  spec.runs = [];
+  runs.forEach(function (r) {
+    if (styleKey(r) === base) return;
+    const last = spec.runs[spec.runs.length - 1];
+    if (last && last.end === r.start && styleKey(last) === styleKey(r)) last.end = r.end;
+    else spec.runs.push(r);
+  });
+  return spec;
+}
+
+// Inline elements that draw a box of their own rather than only formatting text.
+const ATOMIC = ['svg', 'img', 'video', 'canvas', 'iframe', 'input', 'button', 'select', 'textarea'];
+
+function isInlineLevel(el) {
+  return el.tagName.toLowerCase() === 'br' || css(el).display.indexOf('inline') === 0;
+}
+
+// Plain display:inline text formatting, which can fold into a styled range. An inline
+// background, such as a code span's tint, has nowhere to go on a range and is dropped;
+// that beats splitting a paragraph into a row of pieces that can no longer wrap.
+function isPlainInline(el) {
+  const tag = el.tagName.toLowerCase();
+  if (tag === 'br') return true;
+  if (ATOMIC.indexOf(tag) > -1 || css(el).display !== 'inline') return false;
+  return Array.prototype.every.call(el.children, function (c) { return isNonVisual(c) || isPlainInline(c); });
 }
 
 // An <svg> is handed to Figma's own importer rather than read through the CSS box model
@@ -256,16 +378,69 @@ function textSpec(cs, characters) {
 // this file uses: scaling vector content correctly, so a resized frame scales the paths
 // inside it rather than just cropping or padding them, is a separate problem this does
 // not yet attempt.
+//
+// The markup is not passed through untouched, though. An SVG styled from the page's
+// stylesheet, `.n.claude rect { fill: var(--claude) }`, carries none of that in its own
+// markup, and the importer filled every such shape with its default, black. So each
+// element's final computed paint, stroke and font is written onto it as presentation
+// attributes first, variables already resolved, and the importer sees what the browser drew.
 function svgNode(el) {
   const r = el.getBoundingClientRect();
+  const copy = el.cloneNode(true);
+  const src = [el].concat(Array.prototype.slice.call(el.querySelectorAll('*')));
+  const dst = [copy].concat(Array.prototype.slice.call(copy.querySelectorAll('*')));
+  const hidden = [];
+  src.forEach(function (s, i) { if (!inlineSvgStyle(s, dst[i])) hidden.push(dst[i]); });
+  hidden.forEach(function (d) { if (d.parentNode) d.parentNode.removeChild(d); });
+  const w = Math.max(1, Math.round(r.width)), h = Math.max(1, Math.round(r.height));
+  if (!copy.hasAttribute('xmlns')) copy.setAttribute('xmlns', 'http://www.w3.org/2000/svg');
+  copy.setAttribute('width', w);
+  copy.setAttribute('height', h);
   return {
     kind: 'SVG',
     name: nodeName(el, 'svg'),
-    markup: el.outerHTML,
-    sizeH: 'FIXED', fixedWidth: Math.max(1, Math.round(r.width)),
-    sizeV: 'FIXED', fixedHeight: Math.max(1, Math.round(r.height)),
+    markup: copy.outerHTML,
+    sizeH: 'FIXED', fixedWidth: w,
+    sizeV: 'FIXED', fixedHeight: h,
     minWidth: null, maxWidth: null
   };
+}
+
+// A computed paint as SVG presentation attributes understand it: rgb plus a separate
+// opacity, url(#id) without the quotes getComputedStyle adds, and transparent as none.
+function svgPaint(v) {
+  const url = (v || '').match(/url\(["']?([^"')]+)["']?\)/);
+  if (url) return { paint: 'url(' + url[1] + ')', alpha: 1 };
+  const c = colour(v);
+  if (!c) return { paint: 'none', alpha: 1 };
+  return { paint: 'rgb(' + [c.r, c.g, c.b].map(function (n) { return Math.round(n * 255); }).join(',') + ')', alpha: c.a };
+}
+
+// Returns false for an element the page hides, so the caller can remove it.
+function inlineSvgStyle(src, dst) {
+  const cs = css(src);
+  if (cs.display === 'none') return false;
+  dst.removeAttribute('style');
+  dst.removeAttribute('class');
+  ['fill', 'stroke'].forEach(function (p) {
+    const v = svgPaint(cs.getPropertyValue(p));
+    let o = parseFloat(cs.getPropertyValue(p + '-opacity'));
+    if (isNaN(o)) o = 1;
+    dst.setAttribute(p, v.paint);
+    dst.setAttribute(p + '-opacity', String(+(o * v.alpha).toFixed(3)));
+  });
+  ['stroke-width', 'stroke-dasharray', 'stroke-linecap', 'stroke-linejoin', 'opacity'].forEach(function (p) {
+    const v = cs.getPropertyValue(p);
+    if (v) dst.setAttribute(p, v.replace(/px/g, ''));
+  });
+  if (/^(text|tspan|textpath)$/.test(src.tagName.toLowerCase())) {
+    ['font-family', 'font-size', 'font-weight', 'font-style', 'text-anchor'].forEach(function (p) {
+      const v = cs.getPropertyValue(p);
+      if (v) dst.setAttribute(p, v.replace(/px$/, ''));
+    });
+    if (cs.letterSpacing && cs.letterSpacing !== 'normal') dst.setAttribute('letter-spacing', px(cs.letterSpacing));
+  }
+  return true;
 }
 
 function frameSpec(name, layout) {
@@ -290,7 +465,9 @@ function boxIfNeeded(node, cs, sizes) {
     node.grow = sizes.grow;
     return node;
   }
-  node.sizeH = 'FILL'; node.sizeV = 'HUG';
+  // A hugging box needs hugging text: FILL text inside a HUG box is the parent-child
+  // deadlock described in the README, with neither side holding a real number.
+  node.sizeH = sizes.h === 'HUG' ? 'HUG' : 'FILL'; node.sizeV = 'HUG';
   const box = frameSpec(node.name.slice(0, 22) + ' box', 'VERTICAL');
   box.padding = pad;
   box.radius = dec.radius; box.fill = dec.fill; box.borders = dec.borders;
@@ -313,12 +490,21 @@ function mode(nums) {
 function listNode(el, cs, sizes) {
   const items = Array.prototype.slice.call(el.children).filter(function (c) { return c.tagName.toLowerCase() === 'li'; });
   if (!items.length) return null;
-  const liCs = getComputedStyle(items[0]);
-  const lines = items.map(function (li) { return li.textContent.trim().replace(/\s+/g, ' '); });
+  const liCs = css(items[0]);
+  const lines = items.map(richText);
   const cols = parseInt(cs.columnCount, 10) || 1;
 
+  // Each item's styled ranges are shifted by where that item starts in the joined text.
   function make(subset) {
-    const t = textSpec(liCs, subset.join('\n'));
+    let chars = '';
+    const runs = [];
+    subset.forEach(function (line, i) {
+      if (i) chars += '\n';
+      const at = chars.length;
+      line.runs.forEach(function (r) { runs.push(Object.assign({}, r, { start: r.start + at, end: r.end + at })); });
+      chars += line.text;
+    });
+    const t = withRuns(textSpec(liCs, chars), runs);
     t.list = true;
     t.ordered = el.tagName.toLowerCase() === 'ol';
     t.paragraphSpacing = px(liCs.marginBottom);
@@ -345,8 +531,50 @@ function listNode(el, cs, sizes) {
   return boxIfNeeded(make(lines), cs, sizes);
 }
 
+// CSS grid has no Figma equivalent, but its result does: rows of items side by side. Items
+// are grouped by where the browser actually put them, their rendered top edge, so spans,
+// auto placement and responsive templates come out however they rendered, without this
+// file having to understand grid-template syntax. Each item sharing a row is pinned at its
+// measured width, the same real-number rule as everywhere else here; an item alone on its
+// row, such as a header spanning every column, keeps filling the full width.
+function gridRows(built, cs) {
+  const rows = [];
+  built.forEach(function (b) {
+    const r = b.el.getBoundingClientRect();
+    let row = rows.find(function (x) { return Math.abs(x.top - r.top) <= 2; });
+    if (!row) { row = { top: r.top, items: [] }; rows.push(row); }
+    row.items.push({ b: b, r: r });
+  });
+  if (rows.every(function (x) { return x.items.length === 1; })) return built;
+
+  rows.sort(function (a, b) { return a.top - b.top; });
+  const stretch = cs.alignItems === 'normal' || cs.alignItems === 'stretch';
+  return rows.map(function (row, i) {
+    if (row.items.length === 1) return row.items[0].b;
+    row.items.sort(function (a, b) { return a.r.left - b.r.left; });
+    const spec = frameSpec('row-' + (i + 1), 'HORIZONTAL');
+    spec.gap = px(cs.columnGap);
+    let bottom = row.top;
+    row.items.forEach(function (it) {
+      it.b.spec.sizeH = 'FIXED';
+      it.b.spec.fixedWidth = Math.max(1, Math.round(it.r.width));
+      it.b.spec.minWidth = null; it.b.spec.maxWidth = null;
+      bottom = Math.max(bottom, it.r.bottom);
+      spec.children.push(it.b.spec);
+    });
+    // Grid stretches items to the row's height by default; same measured-anchor pattern
+    // as align-items: stretch on a flex row.
+    if (stretch) {
+      spec.sizeV = 'FIXED';
+      spec.fixedHeight = Math.max(1, Math.round(bottom - row.top));
+      row.items.forEach(function (it) { if (it.b.spec.kind === 'FRAME' && it.b.spec.sizeV === 'HUG') it.b.spec.sizeV = 'FILL'; });
+    }
+    return { spec: spec, el: null, m: noMargin(), cs: cs };
+  });
+}
+
 function walk(el, parentLayout, isRoot) {
-  const cs = getComputedStyle(el);
+  const cs = css(el);
   const tag = el.tagName.toLowerCase();
   if (cs.display === 'none' || isNonVisual(el)) return null;
   if (cs.position === 'absolute' || cs.position === 'fixed') warn('Absolute positioning was ignored.');
@@ -356,11 +584,11 @@ function walk(el, parentLayout, isRoot) {
   if (tag === 'svg') return svgNode(el);
 
   const kids = Array.prototype.slice.call(el.children).filter(function (c) {
-    return !isNonVisual(c) && getComputedStyle(c).display !== 'none';
+    return !isNonVisual(c) && css(c).display !== 'none';
   });
 
   if (!kids.length) {
-    const txt = (el.textContent || '').trim().replace(/\s+/g, ' ');
+    const txt = textOf(el, cs);
     if (!txt) {
       const dec = decoration(cs);
       const r = el.getBoundingClientRect();
@@ -401,13 +629,28 @@ function walk(el, parentLayout, isRoot) {
     return boxIfNeeded(textSpec(cs, txt), cs, sizes);
   }
 
-  if (Array.prototype.slice.call(el.childNodes).some(function (n) { return n.nodeType === 3 && n.textContent.trim(); })) {
-    warn('Text sitting directly beside child elements was dropped. Wrap loose text in its own element.');
+  const flex = cs.display === 'flex' || cs.display === 'inline-flex';
+  const grid = cs.display.indexOf('grid') > -1;
+
+  // Loose text beside child elements used to be dropped with a warning, which lost the
+  // legend's labels and the "Script + plan" beside every CP pill. Three shapes now:
+  //   - only plain inline formatting around it, <b>, <em>, <a>: one text node with styled
+  //     ranges, returned right here;
+  //   - inline boxes among it, a pill, an icon: a horizontal row, text and boxes in order;
+  //   - a flex or block container: the text becomes a child of its own, in the
+  //     container's own direction, which is what the browser does with it anyway.
+  const looseText = Array.prototype.some.call(el.childNodes, function (n) { return n.nodeType === 3 && n.textContent.trim(); });
+  let inlineRow = false;
+  if (looseText && !flex && !grid && kids.every(isInlineLevel)) {
+    if (kids.every(isPlainInline)) {
+      const rt = richText(el);
+      return boxIfNeeded(withRuns(textSpec(cs, rt.text), rt.runs), cs, sizes);
+    }
+    inlineRow = true;
   }
 
-  const flex = cs.display === 'flex' || cs.display === 'inline-flex';
-  if (cs.display.indexOf('grid') > -1) warn('CSS grid became a vertical stack.');
-  const layout = (flex && cs.flexDirection.indexOf('row') === 0) ? 'HORIZONTAL' : 'VERTICAL';
+  // A table row is a row: its cells sit side by side.
+  const layout = (inlineRow || cs.display === 'table-row' || (flex && cs.flexDirection.indexOf('row') === 0)) ? 'HORIZONTAL' : 'VERTICAL';
   const blockFlow = !flex;   // block layout collapses adjacent vertical margins; flex does not
 
   const dec = decoration(cs);
@@ -421,13 +664,34 @@ function walk(el, parentLayout, isRoot) {
   node.sizeH = sizes.h; node.sizeV = sizes.v;
   node.minWidth = sizes.minWidth; node.fixedWidth = sizes.fixedWidth; node.maxWidth = sizes.maxWidth;
   node.fixedHeight = sizes.fixedHeight; node.grow = sizes.grow;
+  if (inlineRow) {
+    // Roughly the width of the space the browser left between a pill and its words.
+    node.gap = Math.round(px(cs.fontSize) * 0.25);
+    node.crossAlign = 'CENTER';
+  }
 
-  const built = [];
-  for (const k of kids) {
+  const items = looseText
+    ? Array.prototype.filter.call(el.childNodes, function (n) {
+        return n.nodeType === 3 ? !!n.textContent.trim() : kids.indexOf(n) > -1;
+      })
+    : kids;
+
+  let built = [];
+  for (const k of items) {
+    if (k.nodeType === 3) {
+      const t = textSpec(cs, keepsWhitespace(cs) ? k.textContent : k.textContent.trim().replace(/\s+/g, ' '));
+      // Text in a row wraps into whatever the row leaves it, unless the row itself hugs,
+      // where FILL would have nothing to fill.
+      t.sizeH = layout === 'VERTICAL' ? 'FILL' : (inlineRow && sizes.h !== 'HUG' ? 'FILL' : 'HUG');
+      built.push({ spec: t, el: null, m: noMargin(), cs: cs });
+      continue;
+    }
     const spec = walk(k, layout, false);
-    if (spec) built.push({ spec: spec, el: k, m: margins(k), cs: getComputedStyle(k) });
+    if (spec) built.push({ spec: spec, el: k, m: margins(k), cs: css(k) });
   }
   if (!built.length) return null;
+
+  if (grid && built.length > 1 && built.every(function (b) { return b.el; })) built = gridRows(built, cs);
 
   // A spacer sitting at either end of a horizontal row exists only to push the real
   // content to the far side, a job Figma's own alignment already does natively. Keeping
@@ -436,7 +700,7 @@ function walk(el, parentLayout, isRoot) {
   // for: the two shrink and grow against each other, so a literal number copied out of
   // the CSS routinely does not match what the browser actually rendered. Dropping the
   // spacer and aligning the row to the opposite end sidesteps that arithmetic entirely.
-  if (layout === 'HORIZONTAL') {
+  if (layout === 'HORIZONTAL' && !inlineRow) {
     const spacerAt = built.findIndex(function (b) { return b.spec.isSpacer; });
     if ((spacerAt === 0 || spacerAt === built.length - 1) && built.length > 1) {
       const pushToFarEnd = spacerAt === 0;
@@ -451,7 +715,7 @@ function walk(el, parentLayout, isRoot) {
       // what gets used, in place of a relative instruction with nothing left to resolve
       // against.
       built.forEach(function (b) {
-        if (b.spec.sizeH === 'FILL') {
+        if (b.spec.sizeH === 'FILL' && b.el) {
           const r = b.el.getBoundingClientRect();
           b.spec.sizeH = 'FIXED';
           b.spec.fixedWidth = Math.max(1, Math.round(r.width));
@@ -474,8 +738,8 @@ function walk(el, parentLayout, isRoot) {
   // tell them apart, so each one is measured at its real rendered width in the sandbox
   // and pinned there instead, the same way a fixed spacer's real width was measured
   // rather than trusted to a relative instruction above.
-  if (layout === 'HORIZONTAL') {
-    const growers = built.filter(function (b) { return b.spec.sizeH === 'FILL' && !b.spec.isSpacer; });
+  if (layout === 'HORIZONTAL' && !inlineRow) {
+    const growers = built.filter(function (b) { return b.spec.sizeH === 'FILL' && !b.spec.isSpacer && b.el; });
     const distinctGrows = new Set(growers.map(function (b) { return b.spec.grow; }));
     if (growers.length > 1 && distinctGrows.size > 1) {
       growers.forEach(function (b) {
@@ -500,7 +764,7 @@ function walk(el, parentLayout, isRoot) {
   // automatically, and that was never tested alongside FILL together. It is centred in
   // the row instead, which looks identical for anything with no background of its own
   // to reveal the difference.
-  if (layout === 'HORIZONTAL' && (cs.alignItems === 'stretch' || cs.alignItems === 'normal') && built.length > 1) {
+  if (layout === 'HORIZONTAL' && !inlineRow && (cs.alignItems === 'stretch' || cs.alignItems === 'normal') && built.length > 1) {
     const rowRect = el.getBoundingClientRect();
     node.sizeV = 'FIXED';
     node.fixedHeight = Math.max(1, Math.round(rowRect.height));
@@ -510,7 +774,8 @@ function walk(el, parentLayout, isRoot) {
       if (b.spec.kind === 'FRAME') { b.spec.sizeV = 'FILL'; }
       else { bareTextLeftOut = true; }
     });
-    if (bareTextLeftOut) node.crossAlign = 'CENTER';
+    // Table cells default to vertical-align: top in practice, so a table row stays top aligned.
+    if (bareTextLeftOut && cs.display !== 'table-row') node.crossAlign = 'CENTER';
   }
 
   // Frames have no margin, so margins are expressed as padding, gap, wrappers or spacers.
@@ -635,50 +900,96 @@ function isNonVisual(el) {
   return NON_VISUAL.indexOf(el.tagName.toLowerCase()) > -1;
 }
 
-// A pasted full document has its html, head and body tags discarded by innerHTML, which
-// hoists meta and title into the sandbox and loses whatever the body itself was styled
-// with. So parse it properly, carry the stylesheets across, and stand a div in for body.
-// Rules written against the body selector are rewritten to match that div.
-function mount(html, box) {
-  box.innerHTML = '';
-  const looksLikeDocument = /<!doctype/i.test(html) || /<html[\s>]/i.test(html) || /<body[\s>]/i.test(html);
-
-  if (!looksLikeDocument) {
-    box.innerHTML = html;
-  } else {
-    const doc = new DOMParser().parseFromString(html, 'text/html');
-    const holder = document.createElement('div');
-    holder.className = 'h2f-body';
-    if (doc.body.getAttribute('style')) holder.setAttribute('style', doc.body.getAttribute('style'));
-
-    Array.prototype.slice.call(doc.querySelectorAll('style')).forEach(function (s) {
-      const copy = document.createElement('style');
-      // body and html selectors have to point at the stand in div instead.
-      copy.textContent = s.textContent.replace(/(^|[\s,{}>+~])(body|html)(?=[\s,{:.#\[>+~]|$)/g, '$1.h2f-body');
-      box.appendChild(copy);
-    });
-
-    Array.prototype.slice.call(doc.body.childNodes).forEach(function (n) {
-      holder.appendChild(document.importNode(n, true));
-    });
-    box.appendChild(holder);
-    warn('A full HTML document was pasted. The body element became the outer frame.');
-  }
-
-  // Pick something that actually renders. If several things do, keep them together.
-  const candidates = Array.prototype.slice.call(box.children).filter(function (c) {
-    return !isNonVisual(c) && getComputedStyle(c).display !== 'none';
+// Pick something that actually renders. If several things do, keep them together.
+function pickRoot(doc) {
+  const candidates = Array.prototype.slice.call(doc.body.children).filter(function (c) {
+    return !isNonVisual(c) && css(c).display !== 'none';
   });
   if (!candidates.length) return null;
   if (candidates.length === 1) return candidates[0];
 
-  const holder = document.createElement('div');
+  const holder = doc.createElement('div');
   holder.className = 'h2f-multiple';
   holder.style.display = 'flex';
   holder.style.flexDirection = 'column';
   candidates.forEach(function (c) { holder.appendChild(c); });
-  box.appendChild(holder);
+  doc.body.appendChild(holder);
   return holder;
+}
+
+// Runs inside the render iframe once the page has loaded, and posts the tree back out.
+function htmlizerRun(isDocument) {
+  const msg = { warnings: warnings };
+  try {
+    (window.__h2fErrors || []).forEach(function (m) { warn('A script in the pasted HTML failed: ' + m); });
+    if (isDocument) warn('A full HTML document was pasted. The body element became the outer frame.');
+    const root = isDocument ? document.body : pickRoot(document);
+    if (!root) {
+      msg.error = 'Found no renderable element in that HTML. Everything in it was style, script or metadata.';
+    } else {
+      msg.tree = walk(root, 'VERTICAL', true);
+      if (!msg.tree) msg.error = 'The outer element converted to nothing. It may be empty, or hidden by display none.';
+    }
+  } catch (e) {
+    msg.error = 'Walk failed: ' + e.message;
+  }
+  parent.postMessage({ htmlizer: msg }, '*');
+}
+</script>
+
+<script>
+// The pasted HTML renders inside an iframe of its own at a desktop width, not in this
+// plugin window. Each reason was a real failure first:
+//   - Media queries answer to the viewport they render in. This window is 470px wide, so
+//     every max-width breakpoint in a desktop page fired and the converter read the phone
+//     layout: two-column lists and grids came out as one column.
+//   - A page that builds part of itself with script, a detail panel filled in on load,
+//     converted with that part empty, since scripts in pasted markup never ran. In the
+//     iframe they run as in a browser, in a window of their own, so nothing they declare
+//     collides with this plugin or with a previous conversion. Scripts from a URL still
+//     fail: the manifest allows no network access.
+//   - A full document keeps its real html and body, so body styles apply as written. The
+//     old DOMParser route had to copy stylesheets across and rewrite body selectors onto
+//     a stand-in div.
+//
+// Figma sandboxes this plugin window, which gives every document inside it an origin of
+// its own, so this window cannot reach into the iframe's DOM. The walker therefore runs
+// inside the iframe instead: the script block above is never executed here, its source
+// is appended to the page, and once the page has loaded it walks it and posts the tree
+// back. It is wrapped in a function so none of its names collide with the page's own.
+//
+// color-scheme is pinned to light on the iframe, which a page's prefers-color-scheme
+// answers to, so a page with a dark mode does not convert dark whenever Figma is dark.
+let pending = null;
+
+function mount(html, box, width) {
+  return new Promise(function (resolve) {
+    box.innerHTML = '';
+    const looksLikeDocument = /<!doctype/i.test(html) || /<html[\s>]/i.test(html) || /<body[\s>]/i.test(html);
+    // A fragment gets a standards-mode page whose body shrinks to fit its content, as the
+    // old hidden div did, but with a desktop width available rather than this window's.
+    let page = looksLikeDocument ? html
+      : '<!doctype html><html><head><style>html,body{margin:0}body{position:absolute;left:0;top:0}</style></head><body>' + html + '</body></html>';
+
+    // Error capture has to be in place before the page's own scripts run, and anything
+    // placed ahead of the doctype would drop the page into quirks mode.
+    const catcher = '<script>window.__h2fErrors=[];addEventListener("error",function(e){__h2fErrors.push(e.message)});<\/script>';
+    page = page.replace(/^(\s*<!doctype[^>]*>)?/i, function (m) { return m + catcher; });
+
+    const walker = document.getElementById('walker').textContent.replace(/<\/script/gi, '<\\/script');
+    page += '<script>(function () {\n' + walker + '\naddEventListener("load", function () { htmlizerRun(' + looksLikeDocument + '); });\n})();<\/script>';
+
+    const frame = document.createElement('iframe');
+    frame.style.cssText = 'width:' + width + 'px;height:900px;border:0;color-scheme:light';
+    box.appendChild(frame);
+
+    const timer = setTimeout(function () {
+      pending = null;
+      resolve({ error: 'The pasted HTML never finished loading. A script in it may be stuck in a loop.', warnings: [] });
+    }, 8000);
+    pending = { source: frame, resolve: function (msg) { clearTimeout(timer); pending = null; resolve(msg); } };
+    frame.srcdoc = page;
+  });
 }
 
 document.getElementById('clear').onclick = function () {
@@ -686,24 +997,25 @@ document.getElementById('clear').onclick = function () {
   document.getElementById('log').textContent = '';
 };
 
-document.getElementById('go').onclick = function () {
-  warnings.length = 0;
+document.getElementById('go').onclick = async function () {
   const log = document.getElementById('log');
   const html = document.getElementById('src').value.trim();
   if (!html) { log.textContent = 'Nothing to convert.'; return; }
 
-  const root = mount(html, document.getElementById('sandbox'));
-  if (!root) { log.textContent = 'Found no renderable element in that HTML. Everything in it was style, script or metadata.'; return; }
-
-  let tree;
-  try { tree = walk(root, 'VERTICAL', true); } catch (e) { log.textContent = 'Walk failed: ' + e.message; return; }
-  if (!tree) { log.textContent = 'The outer element converted to nothing. It may be empty, or hidden by display none.'; return; }
+  const width = Math.max(320, parseInt(document.getElementById('vw').value, 10) || 1280);
+  log.textContent = 'Rendering...';
+  const result = await mount(html, document.getElementById('sandbox'), width);
+  if (result.error) { log.textContent = result.error; return; }
 
   log.textContent = 'Sending to canvas...';
-  parent.postMessage({ pluginMessage: { type: 'build', tree: tree, warnings: warnings } }, '*');
+  parent.postMessage({ pluginMessage: { type: 'build', tree: result.tree, warnings: result.warnings } }, '*');
 };
 
 onmessage = function (e) {
+  if (e.data && e.data.htmlizer) {
+    if (pending && e.source === pending.source.contentWindow) pending.resolve(e.data.htmlizer);
+    return;
+  }
   const m = e.data.pluginMessage;
   if (!m) return;
   const log = document.getElementById('log');

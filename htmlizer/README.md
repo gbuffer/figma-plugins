@@ -6,7 +6,7 @@ Built for Grant Hull (Remsoft) with Claude, September 2026. Lives in the `figma-
 
 ## Version
 
-**Current: v1.** Figma validates `manifest.json` strictly and rejects any field it does not recognise, so the version cannot live there as its own field; it lives in the `name` string instead, `"HTMLizer v1"`, and in the plugin's own UI, shown under the heading every time it opens.
+**Current: v6.** Figma validates `manifest.json` strictly and rejects any field it does not recognise, so the version cannot live there as its own field; it lives in the `name` string instead, `"HTMLizer v6"`, and in the plugin's own UI, shown under the heading every time it opens.
 
 Version tracking starts here, at this line being added, not as a claim about how many changes came before it. Bump the number in `manifest.json` and in `ui.html`'s version line on any change that affects what the converter actually does, and add one line below. A wording fix in this document, or a comment-only change, does not need a bump.
 
@@ -15,6 +15,7 @@ Version tracking starts here, at this line being added, not as a claim about how
 - **v3** — `align-items: stretch` implemented, using the same FIXED-parent-plus-FILL-children pattern that fixed v2, applied deliberately this time rather than by accident: the row is measured and pinned, real content frames FILL against it, and a bare line of text with no background of its own is centred natively instead of asked to FILL, since that combination was never tested on a text node.
 - **v4** — experimental, on the `svg-support` branch, not yet merged. An `<svg>` element is now handed whole to `figma.createNodeFromSvg` instead of being read through the CSS box model and silently dropped. Fixed at its own measured size only; scaling vector content with its row is not yet attempted.
 - **v5** — siblings with different `flex-grow` values (`flex: 3` beside `flex: 1`) were coming out an exact 50/50 split in Figma, since Fill sizing has no concept of a ratio, only fill-or-not. The narrower side's fixed-width content then spilled past its own frame's edge into its neighbour, which appeared to sit on top of it. Fixed by measuring each such sibling's real rendered width and pinning it as `FIXED` whenever a row's growing children don't all share one grow value; untouched when they do, which is every other row in this document.
+- **v6** — from the Explainer Video Pipeline page. The HTML now renders in its own iframe at a desktop width (1280px by default, set in the UI), so a page's media queries no longer read the 470px plugin window as a phone. Its inline scripts run, and the walker itself runs inside that iframe. SVG shapes styled from the page's CSS get their computed colours written onto them, where before they imported black. `pre` keeps its line breaks. Table rows are horizontal with measured column widths. A CSS grid becomes rows grouped by where items rendered. Inline-block pills hug their content. Text mixed with inline tags is kept: bold and colour become styled ranges, and pills or icons become a row. `text-transform` maps to Figma text case.
 
 ## The one rule that matters
 
@@ -53,7 +54,13 @@ Re-import after changing `name` or `id` in the manifest, since Figma reads both 
 
 Two halves, as every Figma plugin has.
 
-`ui.html` runs in a real browser iframe, so it has a real DOM. It renders the pasted HTML into a hidden div at its natural width, walks it, and reads `getComputedStyle` on every element. This borrows Chrome's layout engine instead of writing one. It emits a plain JSON tree.
+`ui.html` runs in a real browser iframe, so it has a real DOM. It renders the pasted HTML into a hidden iframe of its own, 1280px wide unless the UI's render width says otherwise, walks it, and reads `getComputedStyle` on every element. This borrows Chrome's layout engine instead of writing one. It emits a plain JSON tree.
+
+The walker runs *inside* that render iframe, not in the plugin window. Figma sandboxes the plugin window, which gives every document inside it an origin of its own, so the plugin window cannot reach into the iframe's DOM at all. So `ui.html` holds the walker in a script block it never executes (`type="text/x-htmlizer-walker"`), appends that source to the pasted page wrapped in a function, and the page posts the tree back once it has loaded. A test that ran the plugin window un-sandboxed would not catch a change that breaks this; test it inside `<iframe sandbox="allow-scripts">`.
+
+The render width matters because media queries answer to the iframe's width. The plugin window is 470px wide, and before v6 the HTML rendered inside it, so every `max-width` breakpoint in a desktop page fired and the converter read the phone layout.
+
+Inline scripts in the pasted HTML run as they would in a browser, so a page that fills part of itself on load converts filled. Scripts loaded from a URL fail, since the manifest allows no network access, and a script error is reported in the log rather than stopping the conversion.
 
 `code.js` runs in the Figma sandbox with no DOM. It receives the tree and builds frames and text nodes.
 
@@ -92,16 +99,22 @@ Transport is paste into a textarea. MCP transport was considered and deferred. I
 | empty div with a fill, a border, or its own explicit width or height | kept as a spacer or rule frame rather than dropped |
 | empty div with none of the above | dropped as noise |
 | `<svg>...</svg>`, anywhere | handed whole to `figma.createNodeFromSvg`; see SVG below |
+| `<tr>` (`display: table-row`) | horizontal auto layout; each cell `FIXED` at its measured width, so columns line up across rows |
+| `display: grid` | children grouped into rows by their rendered top edge; items sharing a row `FIXED` at measured width, an item alone on its row keeps FILL |
+| `display: inline-block` / `inline-flex` in a vertical parent | HUG, so a pill is as wide as its label |
+| text beside only plain inline tags (`b`, `em`, `a`, `code`) | ONE text node, with bold, colour and size as styled ranges |
+| text beside inline boxes (a pill, an icon) | horizontal row: boxes and text in order |
+| text beside block or flex children | its own text node, in the container's direction |
+| `white-space: pre` / `pre-wrap` | spaces and line breaks kept |
+| `text-transform` | Figma text case |
 
 ### Input shapes
 
 Accepts either a bare fragment such as `<div class="wrap">…</div>` with its `<style>` block, or a **complete HTML document** with `<!DOCTYPE>`, `<html>`, `<head>` and `<body>`.
 
-The full document case needs real work, because assigning to `innerHTML` makes the browser discard the `html`, `head` and `body` tags and hoist their contents. That leaves `<meta>` and `<title>` sitting as siblings of the content, and loses whatever `body` itself was styled with. Padding and background on `body` is a common pattern, so losing it matters.
+A full document is written into the render iframe as it is, so its `html` and `body` stay real and body styles apply as written. Its `body` becomes the outer frame, named after the page's `<title>`. Before v6 a document went through `DOMParser`, with its stylesheets copied across and `body` selectors rewritten onto a stand-in div, because `innerHTML` discards `html`, `head` and `body` and loses whatever body was styled with.
 
-So a document is parsed with `DOMParser`, its `<style>` blocks are copied across, and a div stands in for `body`. Rules written against the `body` or `html` selector are rewritten to target that div. The stand in then becomes the outer frame.
-
-The root element is chosen as the first child that actually renders, skipping `style`, `script`, `meta`, `title`, `link`, `base`, `head`, `noscript` and anything with `display: none`. If several things render, they are wrapped together rather than the first one being picked.
+A fragment is wrapped in a standards-mode page whose body shrinks to fit its content, the same as the old hidden div, but with the render width available rather than the plugin window's. Its root element is chosen as the first child that actually renders, skipping `style`, `script`, `meta`, `title`, `link`, `base`, `head`, `noscript` and anything with `display: none`. If several things render, they are wrapped together rather than the first one being picked.
 
 **The original bug here is instructive.** The root picker took the first child that was not a `<style>`, which on a full document is the `<meta>`. Since `meta` is `display: none`, the walker returned nothing and the plugin reported "That produced nothing convertible", which said nothing useful about the cause. Error messages now name what was actually found.
 
@@ -188,7 +201,9 @@ Whenever a row's filling children do not all share the same grow value, each one
 
 An `<svg>` styles itself through geometry and presentation attributes, `fill`, `d`, `cx`, `points`, none of which `getComputedStyle` ever reports, since they aren't CSS. Reading one the normal way finds no background, no border, nothing sized, and every shape inside it gets silently dropped as noise, the same treatment an empty, undecorated div already gets. That is worse than every other unsupported case in Known Limits below, since those at least fail loudly.
 
-Rather than teach this converter to read SVG's own attribute system, which would really be a second converter, an `<svg>` element is handed to Figma's own importer, `figma.createNodeFromSvg`, the same one Figma uses when a person drags an SVG file onto the canvas by hand. The element's raw markup is passed through untouched; path parsing, fills, strokes, groups, all come from Figma's own implementation, not this one.
+Rather than teach this converter to read SVG's own attribute system, which would really be a second converter, an `<svg>` element is handed to Figma's own importer, `figma.createNodeFromSvg`, the same one Figma uses when a person drags an SVG file onto the canvas by hand. Path parsing, fills, strokes, groups, all come from Figma's own implementation, not this one.
+
+Passing the raw markup untouched, as v4 did, broke on any SVG styled from the page's stylesheet: `.n.claude rect { fill: var(--claude) }` lives in the page's CSS, not in the SVG markup, so the importer never saw it and filled every such shape black. Since v6 each element's final computed fill, stroke, stroke width, dash pattern, opacity and font are written onto a copy of it as presentation attributes, with CSS variables and `currentColor` already resolved, and the copy is what gets imported. `transparent` becomes `fill="none"`, and elements the page hides are removed.
 
 It is fixed at its own measured size, not folded into the FILL, HUG or FIXED chain the rest of this file uses. Scaling vector content correctly, so a resized frame scales the paths inside it rather than cropping or padding around them, is a separate problem, not yet attempted. An SVG whose surrounding layout genuinely needs it to grow or shrink with its row will not do that yet; it will render as itself, at its own size, wherever it lands.
 
@@ -217,7 +232,10 @@ Real Figma constraints, not laziness:
 - **Text nodes cannot hold padding, fill or strokes.** Anything needing them gets a wrapper frame, named `<text> box`.
 - **A relative size on one axis, such as `height: 100%`, only ever resolves against a parent with a real size on that axis.** If the parent is itself going to hug, the child is measured and pinned to a fixed number instead of trusted to fill. See "The percentage height trap" above.
 - **Baseline alignment is unavailable** when a child's own size on that axis is FIXED rather than HUG, which any card that has been given an explicit height is. Rarely a loss for card layouts.
-- Not supported: grid, absolute positioning, transforms, shadows, gradients, raster images (`<img>`), pseudo elements, mixed inline formatting. `<svg>` is handled separately; see SVG above. `flex-wrap` is deliberately ignored, because `layoutWrap = WRAP` stops children from filling.
+- Not supported: absolute positioning, transforms, shadows, gradients, raster images (`<img>`), pseudo elements, table `rowspan`. `<svg>` is handled separately; see SVG above. `flex-wrap` is deliberately ignored, because `layoutWrap = WRAP` stops children from filling.
+- **Grid is approximated from its rendered result**, rows of measured items, not rebuilt as a grid. An item spanning several rows lands in the row where its top edge is.
+- **A background on inline text** (a tinted `<code>` inside a paragraph) is dropped. A styled range in Figma holds font and colour but not a background, and splitting the paragraph into a row of boxes would stop it wrapping.
+- **A row of a pill beside text does not wrap.** Short labels only, which is what pills are in practice.
 - Font weights are snapped to real weights. 650 becomes Semi Bold.
 - Fonts missing from Figma fall back to Inter and are reported.
 

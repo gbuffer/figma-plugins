@@ -37,7 +37,10 @@ function note(m) { if (notes.indexOf(m) === -1) notes.push(m); }
 function solid(c) { return { type: 'SOLID', color: { r: c.r, g: c.g, b: c.b }, opacity: c.a }; }
 
 function collectFonts(node, set) {
-  if (node.kind === 'TEXT') set.add(node.fontFamily + '||' + node.fontStyle);
+  if (node.kind === 'TEXT') {
+    set.add(node.fontFamily + '||' + node.fontStyle);
+    (node.runs || []).forEach(function (r) { set.add(r.fontFamily + '||' + r.fontStyle); });
+  }
   if (node.children) node.children.forEach(function (c) { collectFonts(c, set); });
 }
 
@@ -122,9 +125,24 @@ function buildText(spec, fonts) {
   if (spec.lineHeight) t.lineHeight = spec.lineHeight;
   if (spec.letterSpacing) t.letterSpacing = { value: spec.letterSpacing, unit: 'PIXELS' };
   if (spec.paragraphSpacing) t.paragraphSpacing = spec.paragraphSpacing;
+  if (spec.textCase) t.textCase = spec.textCase;
   t.textAlignHorizontal = spec.hAlign || 'LEFT';
-  t.textAutoResize = 'HEIGHT';
+  // Hugging text sizes itself to its own content, a pill's label; everything else keeps a
+  // width from its parent and grows downwards as it wraps.
+  t.textAutoResize = spec.sizeH === 'HUG' ? 'WIDTH_AND_HEIGHT' : 'HEIGHT';
   t.name = spec.name;
+
+  // Styled ranges: the bold, colour or size of inline tags inside one paragraph.
+  (spec.runs || []).forEach(function (r) {
+    try {
+      t.setRangeFontName(r.start, r.end, fonts[r.fontFamily + '||' + r.fontStyle]);
+      t.setRangeFontSize(r.start, r.end, r.fontSize);
+      t.setRangeFills(r.start, r.end, [solid(r.colour)]);
+      t.setRangeTextCase(r.start, r.end, r.textCase || 'ORIGINAL');
+    } catch (e) {
+      note('Some inline formatting (bold, colour, size) could not be applied: ' + e.message);
+    }
+  });
 
   if (spec.list) {
     const end = t.characters.length;
