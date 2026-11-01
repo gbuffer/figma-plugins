@@ -44,7 +44,7 @@
 </style>
 
 <h2>Paste the HTML, including its style block</h2>
-<div class="version">v3 — see README.md for what changed at each version</div>
+<div class="version">v5 — see README.md for what changed at each version</div>
 <textarea id="src" placeholder="&lt;div class=&quot;card&quot;&gt; ... &lt;/div&gt;"></textarea>
 <div class="bar">
   <button id="go">Convert to Figma</button>
@@ -204,7 +204,7 @@ function sizing(cs, parentLayout, isRoot, el) {
   const basis = (cs.flexBasis && cs.flexBasis.indexOf('px') > -1) ? px(cs.flexBasis) : null;
   const explicitW = explicitLength(el, 'width');
   const explicitH = explicitLength(el, 'height');
-  const out = { h: 'HUG', v: 'HUG', minWidth: null, fixedWidth: null, maxWidth: null, fixedHeight: null };
+  const out = { h: 'HUG', v: 'HUG', minWidth: null, fixedWidth: null, maxWidth: null, fixedHeight: null, grow: grow };
   if (cs.maxWidth && cs.maxWidth.indexOf('px') > -1) out.maxWidth = px(cs.maxWidth);
   if (cs.minWidth && cs.minWidth.indexOf('px') > -1) out.minWidth = px(cs.minWidth);
   if (isRoot) { out.h = 'FIXED'; return out; }
@@ -247,6 +247,27 @@ function textSpec(cs, characters) {
   };
 }
 
+// An <svg> is handed to Figma's own importer rather than read through the CSS box model
+// the rest of this converter uses, since SVG styles itself through geometry and
+// presentation attributes, fill, d, cx, points, that getComputedStyle never reports.
+// Reading it the normal way would find no background, no border, nothing sized, and
+// silently drop every shape inside it as noise, the same as an empty, undecorated div.
+// Fixed at its own measured size, not folded into the FILL/HUG/FIXED chain the rest of
+// this file uses: scaling vector content correctly, so a resized frame scales the paths
+// inside it rather than just cropping or padding them, is a separate problem this does
+// not yet attempt.
+function svgNode(el) {
+  const r = el.getBoundingClientRect();
+  return {
+    kind: 'SVG',
+    name: nodeName(el, 'svg'),
+    markup: el.outerHTML,
+    sizeH: 'FIXED', fixedWidth: Math.max(1, Math.round(r.width)),
+    sizeV: 'FIXED', fixedHeight: Math.max(1, Math.round(r.height)),
+    minWidth: null, maxWidth: null
+  };
+}
+
 function frameSpec(name, layout) {
   return {
     kind: 'FRAME', name: name, layout: layout, gap: 0,
@@ -266,6 +287,7 @@ function boxIfNeeded(node, cs, sizes) {
   if (dec.transparent && !needsPad) {
     node.sizeH = sizes.h; node.sizeV = 'HUG';
     node.minWidth = sizes.minWidth; node.fixedWidth = sizes.fixedWidth; node.maxWidth = sizes.maxWidth;
+    node.grow = sizes.grow;
     return node;
   }
   node.sizeH = 'FILL'; node.sizeV = 'HUG';
@@ -274,6 +296,7 @@ function boxIfNeeded(node, cs, sizes) {
   box.radius = dec.radius; box.fill = dec.fill; box.borders = dec.borders;
   box.clip = cs.overflow === 'hidden';
   box.sizeH = sizes.h; box.minWidth = sizes.minWidth; box.fixedWidth = sizes.fixedWidth; box.maxWidth = sizes.maxWidth;
+  box.grow = sizes.grow;
   if (sizes.fixedHeight != null) { box.sizeV = 'FIXED'; box.fixedHeight = sizes.fixedHeight; }
   box.children = [node];
   return box;
@@ -314,7 +337,7 @@ function listNode(el, cs, sizes) {
       t.sizeH = 'FILL';
       row.children.push(t);
     }
-    row.sizeH = sizes.h; row.minWidth = sizes.minWidth; row.maxWidth = sizes.maxWidth;
+    row.sizeH = sizes.h; row.minWidth = sizes.minWidth; row.maxWidth = sizes.maxWidth; row.grow = sizes.grow;
     const pad = { t: px(cs.paddingTop), r: px(cs.paddingRight), b: px(cs.paddingBottom), l: px(cs.paddingLeft) };
     row.padding = pad;
     return row;
@@ -330,6 +353,7 @@ function walk(el, parentLayout, isRoot) {
 
   const sizes = sizing(cs, parentLayout, isRoot, el);
   if (tag === 'ul' || tag === 'ol') return listNode(el, cs, sizes);
+  if (tag === 'svg') return svgNode(el);
 
   const kids = Array.prototype.slice.call(el.children).filter(function (c) {
     return !isNonVisual(c) && getComputedStyle(c).display !== 'none';
@@ -352,7 +376,7 @@ function walk(el, parentLayout, isRoot) {
 
       const node = frameSpec(nodeName(el, dec.transparent ? 'spacer' : 'rule'), 'VERTICAL');
       node.fill = dec.fill; node.borders = dec.borders; node.radius = dec.radius;
-      node.minWidth = sizes.minWidth; node.maxWidth = sizes.maxWidth;
+      node.minWidth = sizes.minWidth; node.maxWidth = sizes.maxWidth; node.grow = sizes.grow;
 
       node.sizeH = explicitW != null ? 'FIXED' : (r.width <= 8 ? 'FIXED' : sizes.h);
       node.fixedWidth = explicitW != null ? explicitW : (r.width <= 8 ? Math.max(1, Math.round(r.width)) : sizes.fixedWidth);
@@ -396,7 +420,7 @@ function walk(el, parentLayout, isRoot) {
   node.clip = cs.overflow === 'hidden';
   node.sizeH = sizes.h; node.sizeV = sizes.v;
   node.minWidth = sizes.minWidth; node.fixedWidth = sizes.fixedWidth; node.maxWidth = sizes.maxWidth;
-  node.fixedHeight = sizes.fixedHeight;
+  node.fixedHeight = sizes.fixedHeight; node.grow = sizes.grow;
 
   const built = [];
   for (const k of kids) {
@@ -433,6 +457,32 @@ function walk(el, parentLayout, isRoot) {
           b.spec.fixedWidth = Math.max(1, Math.round(r.width));
           b.spec.minWidth = null;
         }
+      });
+    }
+  }
+
+  // CSS flex-grow is a ratio between siblings; Figma's Fill sizing is not, it only
+  // knows whether a child fills or does not, splitting whatever space is available
+  // equally among everyone filling it. That reproduces CSS correctly whenever the
+  // growing siblings all share the same grow value, which is the common case (several
+  // flex:1 cards in a row) and is left alone. It cannot reproduce an uneven one:
+  // pain-point-a-wrapper at flex:3 beside pain-point-b-wrapper at flex:1 came out an
+  // exact 50/50 split in Figma rather than 75/25, and the wider content inside the
+  // now too narrow side spilled out past its own frame's edge and across the boundary
+  // into its neighbour, uncontained, since nothing here clips by default. Whenever a
+  // row's filling children do not all share the same grow value, Fill has no way to
+  // tell them apart, so each one is measured at its real rendered width in the sandbox
+  // and pinned there instead, the same way a fixed spacer's real width was measured
+  // rather than trusted to a relative instruction above.
+  if (layout === 'HORIZONTAL') {
+    const growers = built.filter(function (b) { return b.spec.sizeH === 'FILL' && !b.spec.isSpacer; });
+    const distinctGrows = new Set(growers.map(function (b) { return b.spec.grow; }));
+    if (growers.length > 1 && distinctGrows.size > 1) {
+      growers.forEach(function (b) {
+        const r = b.el.getBoundingClientRect();
+        b.spec.sizeH = 'FIXED';
+        b.spec.fixedWidth = Math.max(1, Math.round(r.width));
+        b.spec.minWidth = null;
       });
     }
   }
@@ -658,7 +708,7 @@ onmessage = function (e) {
   if (!m) return;
   const log = document.getElementById('log');
   if (m.type === 'done') {
-    let s = 'Built ' + m.frames + ' frames, ' + m.texts + ' text nodes, ' + m.spacers + ' spacers.';
+    let s = 'Built ' + m.frames + ' frames, ' + m.texts + ' text nodes, ' + m.spacers + ' spacers' + (m.svgs ? ', ' + m.svgs + ' svgs' : '') + '.';
     if (m.fontFallbacks && m.fontFallbacks.length) s += '\nFont missing in Figma, fell back to Inter: ' + m.fontFallbacks.join(', ');
     if (m.notes && m.notes.length) s += '\n' + m.notes.map(function (n) { return '! ' + n; }).join('\n');
     if (m.warnings && m.warnings.length) s += '\n' + m.warnings.map(function (w) { return '! ' + w; }).join('\n');

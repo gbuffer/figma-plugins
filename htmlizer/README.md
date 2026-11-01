@@ -13,6 +13,8 @@ Version tracking starts here, at this line being added, not as a claim about how
 - **v1** — version tracking begins. Equal-height-cards retracted; FILL height removed from horizontal-row children entirely. A leading or trailing spacer in a horizontal row is dropped and replaced with native row alignment, since a "fixed" px width in the source CSS is not actually fixed once a flexible sibling can shrink it.
 - **v2** — v1's spacer fix gave the remaining content HUG width once its spacer sibling was dropped, which deadlocked against that content's own FILL children one level down: a HUG parent with FILL children, the same failure already covered above, just moved. Fixed by giving the remaining content a real, measured FIXED width instead.
 - **v3** — `align-items: stretch` implemented, using the same FIXED-parent-plus-FILL-children pattern that fixed v2, applied deliberately this time rather than by accident: the row is measured and pinned, real content frames FILL against it, and a bare line of text with no background of its own is centred natively instead of asked to FILL, since that combination was never tested on a text node.
+- **v4** — experimental, on the `svg-support` branch, not yet merged. An `<svg>` element is now handed whole to `figma.createNodeFromSvg` instead of being read through the CSS box model and silently dropped. Fixed at its own measured size only; scaling vector content with its row is not yet attempted.
+- **v5** — siblings with different `flex-grow` values (`flex: 3` beside `flex: 1`) were coming out an exact 50/50 split in Figma, since Fill sizing has no concept of a ratio, only fill-or-not. The narrower side's fixed-width content then spilled past its own frame's edge into its neighbour, which appeared to sit on top of it. Fixed by measuring each such sibling's real rendered width and pinning it as `FIXED` whenever a row's growing children don't all share one grow value; untouched when they do, which is every other row in this document.
 
 ## The one rule that matters
 
@@ -71,6 +73,7 @@ Transport is paste into a textarea. MCP transport was considered and deferred. I
 | `flex-basis` in px with grow | FILL plus `minWidth` |
 | `flex-basis` in px without grow | FIXED width |
 | child of a horizontal row | `layoutSizingVertical = HUG`, unless the row stretches; see "align-items: stretch" |
+| siblings with different `flex-grow` values, both filling | measured and pinned `FIXED` each; see "Unequal flex-grow" |
 | `align-items: stretch`, or unset, on a horizontal row with 2+ children | row measured and pinned `FIXED`; real content frames set to FILL against it |
 | child of a vertical column | `layoutSizingHorizontal = FILL` |
 | `max-width` in px | `maxWidth` |
@@ -88,6 +91,7 @@ Transport is paste into a textarea. MCP transport was considered and deferred. I
 | a leading or trailing spacer in a horizontal row | dropped; the row's own alignment pushes the real content instead |
 | empty div with a fill, a border, or its own explicit width or height | kept as a spacer or rule frame rather than dropped |
 | empty div with none of the above | dropped as noise |
+| `<svg>...</svg>`, anywhere | handed whole to `figma.createNodeFromSvg`; see SVG below |
 
 ### Input shapes
 
@@ -172,7 +176,26 @@ The converter's older behaviour quietly treated `stretch` as `flex-start`, so ev
 
 The safe version follows the same pattern that fixed the width problem: measure what the row actually stretched to in the real sandbox, pin the row itself to that as a `FIXED` height, then let the real content frames FILL against that concrete anchor rather than against each other. A bare line of text, an arrow with no background of its own, is left out of the FILL and centred in the row instead, using Figma's own native alignment: Figma resizes a text node's own height automatically, and asking it to also FILL was never tested alongside that, so the untested combination is avoided rather than assumed safe. Since a filled child ignores the row's alignment entirely, centring the row affects only whatever bare text was left out, with no effect on the frames beside it.
 
+### Unequal flex-grow
+
+CSS flex-grow is a ratio between siblings: `flex: 3` beside `flex: 1` gives the first one three quarters of the available space, the second one a quarter. Figma's Fill sizing has no ratio in it at all, only fill-or-not; when two siblings both fill, Figma splits whatever is available equally between them, with no way to weight one more than the other.
+
+That reproduces CSS correctly whenever the growing siblings all share the same grow value, which is the ordinary case throughout this document, several `flex: 1` cards in a row, and is left alone. It cannot reproduce an uneven one. A real document had a wrapper at `flex: 3` beside a wrapper at `flex: 1`, and Figma gave both exactly half the row instead of three quarters and a quarter. The `flex: 3` side held a fixed-width row of cards that needed more room than half the row could give it, so its content spilled out past its own frame's edge, uncontained since nothing here clips by default, and ran straight across the boundary into its neighbour, which then appeared to be drawn on top of it.
+
+Whenever a row's filling children do not all share the same grow value, each one is measured at its real rendered width in the sandbox and pinned there as a `FIXED` width instead, the same principle as the fixed spacer above: a ratio Figma cannot express becomes a real number instead of a relative instruction two siblings are both waiting on each other to resolve.
+
+### SVG
+
+An `<svg>` styles itself through geometry and presentation attributes, `fill`, `d`, `cx`, `points`, none of which `getComputedStyle` ever reports, since they aren't CSS. Reading one the normal way finds no background, no border, nothing sized, and every shape inside it gets silently dropped as noise, the same treatment an empty, undecorated div already gets. That is worse than every other unsupported case in Known Limits below, since those at least fail loudly.
+
+Rather than teach this converter to read SVG's own attribute system, which would really be a second converter, an `<svg>` element is handed to Figma's own importer, `figma.createNodeFromSvg`, the same one Figma uses when a person drags an SVG file onto the canvas by hand. The element's raw markup is passed through untouched; path parsing, fills, strokes, groups, all come from Figma's own implementation, not this one.
+
+It is fixed at its own measured size, not folded into the FILL, HUG or FIXED chain the rest of this file uses. Scaling vector content correctly, so a resized frame scales the paths inside it rather than cropping or padding around them, is a separate problem, not yet attempted. An SVG whose surrounding layout genuinely needs it to grow or shrink with its row will not do that yet; it will render as itself, at its own size, wherever it lands.
+
+If `figma.createNodeFromSvg` rejects the markup for any reason, the SVG is replaced with an empty box of the same size rather than failing the whole build, and the plugin's log names which one and why.
+
 ### Layer names
+
 
 A frame's Figma name is tried in order, each step only reached if the one before it found nothing: `data-name`, then `id`, then `class`, then a slug built from the element's own text content, then the tag plus its position among its siblings.
 
@@ -194,7 +217,7 @@ Real Figma constraints, not laziness:
 - **Text nodes cannot hold padding, fill or strokes.** Anything needing them gets a wrapper frame, named `<text> box`.
 - **A relative size on one axis, such as `height: 100%`, only ever resolves against a parent with a real size on that axis.** If the parent is itself going to hug, the child is measured and pinned to a fixed number instead of trusted to fill. See "The percentage height trap" above.
 - **Baseline alignment is unavailable** when a child's own size on that axis is FIXED rather than HUG, which any card that has been given an explicit height is. Rarely a loss for card layouts.
-- Not supported: grid, absolute positioning, transforms, shadows, gradients, images, pseudo elements, mixed inline formatting. `flex-wrap` is deliberately ignored, because `layoutWrap = WRAP` stops children from filling.
+- Not supported: grid, absolute positioning, transforms, shadows, gradients, raster images (`<img>`), pseudo elements, mixed inline formatting. `<svg>` is handled separately; see SVG above. `flex-wrap` is deliberately ignored, because `layoutWrap = WRAP` stops children from filling.
 - Font weights are snapped to real weights. 650 becomes Semi Bold.
 - Fonts missing from Figma fall back to Inter and are reported.
 

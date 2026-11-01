@@ -29,7 +29,7 @@
 
 figma.showUI(__html__, { width: 470, height: 560, themeColors: true });
 
-let counts = { frames: 0, texts: 0, spacers: 0 };
+let counts = { frames: 0, texts: 0, spacers: 0, svgs: 0 };
 const fallbacks = [];
 const notes = [];
 
@@ -152,6 +152,27 @@ function buildSpacer(spec) {
   return f;
 }
 
+// createNodeFromSvg is the same importer Figma uses when an SVG file is dragged onto the
+// canvas by hand: it parses the markup and returns a real FrameNode holding real vector
+// nodes, paths and all, rather than anything this converter has to reconstruct itself.
+// Resizing to the sandbox's own measured width and height happens through the ordinary
+// applySizing path below, the same as every other fixed-size node, not here.
+function buildSvg(spec) {
+  try {
+    const node = figma.createNodeFromSvg(spec.markup);
+    node.name = spec.name;
+    counts.svgs++;
+    return node;
+  } catch (e) {
+    note('An <svg> ("' + spec.name + '") failed to import and was replaced with an empty box: ' + e.message);
+    const f = figma.createFrame();
+    f.name = spec.name + ' (svg failed)';
+    f.fills = [];
+    counts.frames++;
+    return f;
+  }
+}
+
 function buildFrame(spec, fonts) {
   const f = figma.createFrame();
   f.name = spec.name;
@@ -182,12 +203,13 @@ function buildFrame(spec, fonts) {
 function build(spec, fonts) {
   if (spec.kind === 'TEXT') return buildText(spec, fonts);
   if (spec.kind === 'SPACER') return buildSpacer(spec);
+  if (spec.kind === 'SVG') return buildSvg(spec);
   return buildFrame(spec, fonts);
 }
 
 figma.ui.onmessage = async function (msg) {
   if (msg.type !== 'build') return;
-  counts = { frames: 0, texts: 0, spacers: 0 };
+  counts = { frames: 0, texts: 0, spacers: 0, svgs: 0 };
   fallbacks.length = 0;
   notes.length = 0;
 
@@ -211,6 +233,7 @@ figma.ui.onmessage = async function (msg) {
       frames: counts.frames,
       texts: counts.texts,
       spacers: counts.spacers,
+      svgs: counts.svgs,
       fontFallbacks: fallbacks,
       notes: notes,
       warnings: msg.warnings || []
